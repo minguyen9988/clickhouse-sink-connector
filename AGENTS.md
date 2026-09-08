@@ -25,6 +25,39 @@ plainly:
    A divergence is never resolved by adjusting, reinterpreting, or excusing
    the MySQL side, and never by declaring the ClickHouse state acceptable.
    The direction of the fix is fixed: ClickHouse moves to MySQL.
+4. **The connector is the ENFORCER of that rule, not a reporter of it.**
+   It does not merely detect divergence and describe it — it makes
+   ClickHouse correct according to MySQL. When the ClickHouse side is in a
+   shape that prevents the source value from being stored, the connector
+   changes the ClickHouse side so it can be stored. **Reporting is the
+   fallback for when enforcement genuinely fails, never the default.**
+
+### Enforcement, concretely
+
+Enforcement is an action, so it has a shape. Whenever you find the replica
+unable to hold what the source sent:
+
+- **Correct the ClickHouse side automatically** where a safe, bounded
+  operation exists. A MATERIALIZED column shadowing a source value is
+  fixed with `ALTER TABLE ... MODIFY COLUMN <col> <type>`, restating the
+  type with no default expression — metadata-only, no part rewrite, on the
+  same DDL path the connector already uses for schema evolution.
+- **Enforcement has two halves, and the second is easy to forget.**
+  Correcting the definition fixes the write path *forward*. Rows already
+  written while the definition was wrong still hold the wrong values, and
+  reconciling those is a **backfill** of the affected range. A change that
+  fixes only the forward path is half-done — say so explicitly in the log
+  and in the PR, so the remaining work is visible rather than assumed done.
+- **Log the enforcement, loudly.** An automatic schema correction is a real
+  event: record what was wrong, what was changed, and what still needs
+  backfilling.
+- **Only when enforcement cannot be performed** — the DDL is rejected, the
+  privilege is missing, the type cannot be read — do you fall back to a
+  warning naming the manual remediation.
+
+Do not write code whose response to a divergence is only a log line. If you
+find yourself describing a fix for a human to apply, ask first whether the
+connector can apply it.
 
 ### What this means when you are deciding something
 
@@ -52,7 +85,7 @@ that have caused real production incidents:
 | ClickHouse column kind | Rule |
 |---|---|
 | **ALIAS** | **Ignore it.** An ALIAS column is not stored and cannot be written. It is a query-time expression, never part of the replicated row. |
-| **MATERIALIZED** | **If MySQL defines a column of the same name, the MySQL value WINS and must be written.** A MATERIALIZED definition on the ClickHouse side must never silently shadow, override, or discard a value the source supplies. ClickHouse computing something locally does not make it the truth — MySQL is the truth. If a MATERIALIZED column blocks writing the source value, the MATERIALIZED definition is the thing that is wrong, and the fix is on the ClickHouse side. |
+| **MATERIALIZED** | **If MySQL defines a column of the same name, the MySQL value WINS and must be written.** A MATERIALIZED definition on the ClickHouse side must never silently shadow, override, or discard a value the source supplies. ClickHouse computing something locally does not make it the truth — MySQL is the truth. If a MATERIALIZED column blocks writing the source value, the MATERIALIZED definition is the thing that is wrong, and **the connector corrects it** — `ALTER TABLE ... MODIFY COLUMN` strips the expression so the source value is stored from then on, and the rows written before that are backfilled. |
 | **DEFAULT / ordinary** | Normal replicated column. Bind the source value, including NULL. Never let a ClickHouse DEFAULT stand in for a value MySQL actually sent. |
 
 The trap: a column that is MATERIALIZED in ClickHouse *and* present in
