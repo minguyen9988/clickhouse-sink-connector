@@ -317,15 +317,28 @@ public class GroupInsertQueryWithBatchRecords {
             }
         }
 
+        String fullyQualifiedTableName = databaseName + "." + tableName;
+        CacheInvalidationManager invalidation = CacheInvalidationManager.getInstance();
+
         String unknown = null;
         for (Field field : struct.schema().fields()) {
             if (field == null || field.name() == null) {
                 continue;
             }
-            if (!known.contains(field.name().toLowerCase())) {
-                unknown = field.name();
-                break;
+            if (known.contains(field.name().toLowerCase())) {
+                continue;
             }
+            // A column already proven absent by a fresh read is not evidence of
+            // staleness: ClickHouse owns it (MATERIALIZED / ALIAS) and no
+            // re-read will ever produce it. Skipping it here is what keeps the
+            // probe at one metadata query per column per DDL generation rather
+            // than one per record.
+            if (invalidation.isColumnProvenAbsent(
+                    fullyQualifiedTableName, field.name())) {
+                continue;
+            }
+            unknown = field.name();
+            break;
         }
         if (unknown == null) {
             return null;
@@ -339,11 +352,32 @@ public class GroupInsertQueryWithBatchRecords {
             Map<String, String> fresh = new DBMetadata(config)
                     .getColumnsDataTypesForTable(tableName, connection, databaseName);
             if (fresh != null && !fresh.isEmpty()) {
-                // Bump the shared version so every other cached writer for this
-                // table rebuilds too, rather than each one rediscovering the
-                // staleness independently on its own next batch.
-                CacheInvalidationManager.getInstance()
-                        .invalidateTable(databaseName + "." + tableName);
+                if (containsColumn(fresh, unknown)) {
+                    // The re-read resolved the staleness. Bump the shared
+                    // version so every other cached writer for this table
+                    // rebuilds too, rather than each one rediscovering the
+                    // staleness independently on its own next batch.
+                    invalidation.invalidateTable(fullyQualifiedTableName);
+                    return fresh;
+                }
+                // The re-read did NOT produce the column, so the cache was
+                // never stale. The column is one ClickHouse computes --
+                // getColumnsDataTypesForTable filters MATERIALIZED and ALIAS
+                // out by design, because binding them makes ClickHouse reject
+                // the INSERT. Record the proof and use the fresh map.
+                //
+                // Without the proof this path repeats for EVERY record, and
+                // the invalidateTable() on top of it makes every cached writer
+                // for the table rebuild on its next batch. The result is an
+                // unbounded system.columns query storm for as long as the
+                // table keeps receiving traffic -- see the PR description for
+                // a measured production case.
+                log.info("Column '{}' is not part of {}'s writable column map after a "
+                                + "fresh read; it is computed by ClickHouse (MATERIALIZED "
+                                + "or ALIAS) and is correctly excluded. Recording this so "
+                                + "the metadata read is not repeated per record.",
+                        unknown, fullyQualifiedTableName);
+                invalidation.markColumnProvenAbsent(fullyQualifiedTableName, unknown);
                 return fresh;
             }
             log.warn("Re-read of {}.{} returned no columns; keeping the cached map. The "
@@ -355,6 +389,30 @@ public class GroupInsertQueryWithBatchRecords {
                     databaseName, tableName, e);
         }
         return null;
+    }
+
+    /**
+     * Case-insensitive membership test against a column map's key set.
+     *
+     * <p>The cached map is compared case-insensitively everywhere else in this
+     * class, so the post-re-read check must be too -- otherwise a column whose
+     * ClickHouse casing differs from the source's would be judged still-missing
+     * and marked proven-absent even though the re-read did resolve it.</p>
+     *
+     * @param columns    the column map to search.
+     * @param columnName the column name to look for.
+     * @return true when the map contains the column under any casing.
+     */
+    private boolean containsColumn(Map<String, String> columns, String columnName) {
+        if (columns == null || columnName == null) {
+            return false;
+        }
+        for (String column : columns.keySet()) {
+            if (column != null && column.equalsIgnoreCase(columnName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
