@@ -593,6 +593,173 @@ public class DBMetadata {
     }
 
     /**
+     * Returns the declared type of a single column, or null when the column
+     * does not exist in ClickHouse or cannot be read.
+     *
+     * <p>Needed to rewrite a column definition: {@code MODIFY COLUMN} must
+     * restate the type, and restating it from anywhere other than
+     * {@code system.columns} risks changing it by accident.</p>
+     *
+     * @param tableName    the ClickHouse table name.
+     * @param databaseName the ClickHouse database name.
+     * @param columnName   the column to look up; matched case-insensitively.
+     * @param conn         the connection to read metadata with.
+     * @return the column's declared type, or null.
+     */
+    public String getColumnType(String tableName, String databaseName,
+                                String columnName, Connection conn) {
+        if (tableName == null || databaseName == null || columnName == null
+                || conn == null) {
+            return null;
+        }
+        String query = String.format(
+                "SELECT type FROM system.columns WHERE database = '%s' "
+                        + "AND table = '%s' AND lower(name) = lower('%s')",
+                databaseName, tableName, columnName);
+        try (ResultSet rs = conn.createStatement().executeQuery(query)) {
+            if (rs != null && rs.next()) {
+                return rs.getString(1);
+            }
+        } catch (Exception e) {
+            log.warn("Could not read the declared type of {}.{}.{}",
+                    databaseName, tableName, columnName, e);
+        }
+        return null;
+    }
+
+    /**
+     * Strips a column's DEFAULT-kind expression so the connector can write
+     * the source's value into it, and returns whether the column is now
+     * writable.
+     *
+     * <p>This is the enforcement half of the replication contract. The source
+     * database is the authority on what the data is, and this connector is
+     * what makes ClickHouse agree with it. A column defined MATERIALIZED on
+     * the ClickHouse side breaks that: ClickHouse computes and stores its own
+     * value, the source's value for the same column is never written, and the
+     * two sides disagree silently -- no error, no failed batch, identical row
+     * counts. Reporting that is not enough. The ClickHouse definition is the
+     * thing that is wrong, so the connector corrects it.</p>
+     *
+     * <p>{@code ALTER TABLE ... MODIFY COLUMN <col> <type>} restates the
+     * column with no default expression, which drops the MATERIALIZED clause
+     * and leaves an ordinary column. It is a metadata-only change: existing
+     * parts are not rewritten, so it is cheap and does not block.</p>
+     *
+     * <p><b>It fixes the write path forward, not history.</b> Rows written
+     * while the column was MATERIALIZED still hold ClickHouse's computed
+     * values; reconciling those is a backfill, and the caller is told so.</p>
+     *
+     * @param tableName    the ClickHouse table name.
+     * @param databaseName the ClickHouse database name.
+     * @param columnName   the column whose default expression is removed.
+     * @param columnType   the column's declared type, restated verbatim.
+     * @param conn         the connection to issue the DDL on.
+     * @return true when the column was successfully made writable.
+     */
+    public boolean makeColumnWritable(String tableName, String databaseName,
+                                      String columnName, String columnType,
+                                      Connection conn) {
+        if (tableName == null || databaseName == null || columnName == null
+                || columnType == null || columnType.isEmpty() || conn == null) {
+            return false;
+        }
+        // Backticks, not plain identifiers: replicated table and column names
+        // routinely contain characters ClickHouse would otherwise parse.
+        String ddl = String.format(
+                "ALTER TABLE `%s`.`%s` MODIFY COLUMN `%s` %s",
+                databaseName, tableName, columnName, columnType);
+        try {
+            log.info("Enforcing source conformance on {}.{}: {}",
+                    databaseName, tableName, ddl);
+            executeSystemQuery(conn, ddl);
+        } catch (Exception e) {
+            log.warn("Could not make {}.{}.{} writable; the source value for "
+                            + "this column cannot be stored until the "
+                            + "ClickHouse definition is corrected.",
+                    databaseName, tableName, columnName, e);
+            return false;
+        }
+
+        // Confirm the enforcement actually took effect rather than trusting
+        // the absence of an exception. executeSystemQuery retries a failing
+        // statement and, once the retry budget is spent, RETURNS NORMALLY --
+        // so a rejected ALTER (missing privilege, unsupported change) is
+        // indistinguishable from a successful one at the call site. Reporting
+        // success there would be the worst possible outcome: the caller would
+        // believe the replica had been corrected and stop warning, while the
+        // source value continued to be silently discarded.
+        String kindAfter = getColumnDefaultKind(tableName, databaseName,
+                columnName, conn);
+        boolean stillShadowed = "MATERIALIZED".equalsIgnoreCase(kindAfter)
+                || "ALIAS".equalsIgnoreCase(kindAfter);
+        if (stillShadowed || kindAfter == null) {
+            log.warn("Enforcement did not take effect on {}.{}.{}: its "
+                            + "default_kind is still '{}' after the ALTER. The "
+                            + "source value for this column is still not being "
+                            + "stored -- correct the ClickHouse definition by "
+                            + "hand, or grant the connector ALTER TABLE on this "
+                            + "table.",
+                    databaseName, tableName, columnName,
+                    kindAfter == null ? "unreadable" : kindAfter);
+            return false;
+        }
+        return true;
+    }
+
+    /**
+     * Returns the {@code default_kind} of a single column, or null when the
+     * column does not exist in ClickHouse.
+     *
+     * <p>The connector replicates a source database into ClickHouse, so the
+     * source is the authority on what the data is. That makes ALIAS and
+     * MATERIALIZED two very different situations, even though
+     * {@link #getColumnsDataTypesForTable} excludes both from the writable
+     * column map:</p>
+     *
+     * <ul>
+     *   <li><b>ALIAS</b> is not stored at all. There is nothing to diverge,
+     *       so a source column that is ALIAS here is simply ignored.</li>
+     *   <li><b>MATERIALIZED</b> IS stored, and ClickHouse computes it. If the
+     *       source also supplies that column, the stored value is whatever
+     *       ClickHouse derived rather than what the source sent -- the
+     *       replica silently disagrees with its source, with no error and
+     *       matching row counts.</li>
+     * </ul>
+     *
+     * <p>Distinguishing the two is what lets the caller stay silent about the
+     * former and report the latter.</p>
+     *
+     * @param tableName    the ClickHouse table name.
+     * @param databaseName the ClickHouse database name.
+     * @param columnName   the column to look up; matched case-insensitively.
+     * @param conn         the connection to read metadata with.
+     * @return the column's {@code default_kind} (possibly an empty string for
+     *         an ordinary column), or null when it cannot be determined.
+     */
+    public String getColumnDefaultKind(String tableName, String databaseName,
+                                       String columnName, Connection conn) {
+        if (tableName == null || databaseName == null || columnName == null
+                || conn == null) {
+            return null;
+        }
+        String query = String.format(
+                "SELECT default_kind FROM system.columns WHERE database = '%s' "
+                        + "AND table = '%s' AND lower(name) = lower('%s')",
+                databaseName, tableName, columnName);
+        try (ResultSet rs = conn.createStatement().executeQuery(query)) {
+            if (rs != null && rs.next()) {
+                String kind = rs.getString(1);
+                return kind == null ? "" : kind;
+            }
+        } catch (Exception e) {
+            log.warn("Could not read default_kind for {}.{}.{}", databaseName,
+                    tableName, columnName, e);
+        }
+        return null;
+    }
+
+    /**
      * Retrieves the set of column names that are aliases or materialized columns
      * for a given table and database.
      *
@@ -702,7 +869,13 @@ public class DBMetadata {
      * dictionaries (487) and columns (44/15).</p>
      */
     private static final Set<Integer> NON_RETRYABLE_ERROR_CODES = Collections.unmodifiableSet(
-            new HashSet<>(Arrays.asList(15, 44, 47, 57, 60, 62, 81, 82, 487)));
+            // 497 ACCESS_DENIED is deterministic in exactly the same way as
+            // the rest: a privilege the connector does not hold will not be
+            // granted by sleeping. It matters most for the enforcement path
+            // (ALTER TABLE ... MODIFY COLUMN), where retrying a denied ALTER
+            // blocks the CDC/DDL thread for the whole retry budget and still
+            // fails.
+            new HashSet<>(Arrays.asList(15, 44, 47, 57, 60, 62, 81, 82, 487, 497)));
 
     /**
      * Decides whether a failed statement can plausibly succeed on a retry.

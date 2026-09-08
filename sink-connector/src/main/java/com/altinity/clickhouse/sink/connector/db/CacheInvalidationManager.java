@@ -40,6 +40,29 @@ public class CacheInvalidationManager {
     private final Map<String, Long> tableVersions = new ConcurrentHashMap<>();
 
     /**
+     * Columns proven, by a fresh metadata read, NOT to be part of a table's
+     * writable column map -- keyed by "database.table", then by lower-cased
+     * column name, valued with the table version the proof was taken at.
+     *
+     * <p>Not every column carried by a CDC record is expected to appear in the
+     * cached column map. {@code DBMetadata#getColumnsDataTypesForTable}
+     * deliberately drops columns whose {@code default_kind} is
+     * {@code MATERIALIZED} or {@code ALIAS}, because ClickHouse computes those
+     * and refuses an INSERT that binds them. A source column that was made
+     * MATERIALIZED on the ClickHouse side is therefore absent from the map
+     * permanently and correctly -- it is not evidence of a stale cache, and
+     * re-reading metadata will never make it appear.</p>
+     *
+     * <p>Recording that proof is what stops the re-read from repeating per
+     * record. The version is stored alongside so a later genuine DDL (which
+     * bumps the version) discards the proof and the column is probed once
+     * more -- covering the case where a MATERIALIZED column is redefined as
+     * an ordinary one.</p>
+     */
+    private final Map<String, Map<String, Long>> columnsProvenAbsent =
+            new ConcurrentHashMap<>();
+
+    /**
      * Private constructor to enforce singleton pattern.
      */
     private CacheInvalidationManager() {
@@ -123,10 +146,72 @@ public class CacheInvalidationManager {
             new java.util.concurrent.atomic.AtomicLong();
 
     /**
+     * Records that a fresh metadata read proved {@code columnName} is not part
+     * of {@code tableName}'s writable column map at the current table version.
+     *
+     * <p>Called after a re-read that did not resolve the apparent staleness.
+     * The only way that happens is a column ClickHouse owns -- MATERIALIZED or
+     * ALIAS -- which {@code getColumnsDataTypesForTable} filters out by design.
+     * Without this record the caller re-reads metadata for the same column on
+     * every subsequent record forever.</p>
+     *
+     * @param tableName  fully qualified table name ("database.table").
+     * @param columnName the column proven absent; compared case-insensitively.
+     */
+    public void markColumnProvenAbsent(String tableName, String columnName) {
+        if (tableName == null || tableName.isEmpty()
+                || columnName == null || columnName.isEmpty()) {
+            return;
+        }
+        columnsProvenAbsent
+                .computeIfAbsent(tableName, k -> new ConcurrentHashMap<>())
+                .put(columnName.toLowerCase(), getVersion(tableName));
+    }
+
+    /**
+     * Returns true if {@code columnName} was already proven absent from
+     * {@code tableName} at the table's CURRENT version.
+     *
+     * <p>A proof taken at an older version is ignored (and discarded), because
+     * a DDL since then may have turned the column into an ordinary one that a
+     * re-read would now find.</p>
+     *
+     * @param tableName  fully qualified table name ("database.table").
+     * @param columnName the column to test; compared case-insensitively.
+     * @return true when a re-read for this column would be pointless.
+     */
+    public boolean isColumnProvenAbsent(String tableName, String columnName) {
+        if (tableName == null || tableName.isEmpty()
+                || columnName == null || columnName.isEmpty()) {
+            return false;
+        }
+        Map<String, Long> proven = columnsProvenAbsent.get(tableName);
+        if (proven == null) {
+            return false;
+        }
+        Long provenAt = proven.get(columnName.toLowerCase());
+        if (provenAt == null) {
+            return false;
+        }
+        // longValue() is explicit on purpose: `provenAt == getVersion(...)`
+        // would read as a reference comparison even though it unboxes here,
+        // and a later refactor returning a boxed Long would silently make it
+        // one -- which fails above the Long cache and reinstates the storm.
+        if (provenAt.longValue() == getVersion(tableName)) {
+            return true;
+        }
+        // Stale proof: a DDL landed after it was taken. Drop it so the column
+        // is probed once against the new schema.
+        proven.remove(columnName.toLowerCase());
+        return false;
+    }
+
+    /**
      * Clears all invalidation versions. Useful for testing.
      */
     public void clearAll() {
         tableVersions.clear();
+        columnsProvenAbsent.clear();
         globalEpoch.set(0L);
     }
 

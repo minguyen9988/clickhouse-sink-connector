@@ -317,15 +317,28 @@ public class GroupInsertQueryWithBatchRecords {
             }
         }
 
+        String fullyQualifiedTableName = databaseName + "." + tableName;
+        CacheInvalidationManager invalidation = CacheInvalidationManager.getInstance();
+
         String unknown = null;
         for (Field field : struct.schema().fields()) {
             if (field == null || field.name() == null) {
                 continue;
             }
-            if (!known.contains(field.name().toLowerCase())) {
-                unknown = field.name();
-                break;
+            if (known.contains(field.name().toLowerCase())) {
+                continue;
             }
+            // A column already proven absent by a fresh read is not evidence of
+            // staleness: ClickHouse owns it (MATERIALIZED / ALIAS) and no
+            // re-read will ever produce it. Skipping it here is what keeps the
+            // probe at one metadata query per column per DDL generation rather
+            // than one per record.
+            if (invalidation.isColumnProvenAbsent(
+                    fullyQualifiedTableName, field.name())) {
+                continue;
+            }
+            unknown = field.name();
+            break;
         }
         if (unknown == null) {
             return null;
@@ -339,11 +352,54 @@ public class GroupInsertQueryWithBatchRecords {
             Map<String, String> fresh = new DBMetadata(config)
                     .getColumnsDataTypesForTable(tableName, connection, databaseName);
             if (fresh != null && !fresh.isEmpty()) {
-                // Bump the shared version so every other cached writer for this
-                // table rebuilds too, rather than each one rediscovering the
-                // staleness independently on its own next batch.
-                CacheInvalidationManager.getInstance()
-                        .invalidateTable(databaseName + "." + tableName);
+                if (containsColumn(fresh, unknown)) {
+                    // The re-read resolved the staleness. Bump the shared
+                    // version so every other cached writer for this table
+                    // rebuilds too, rather than each one rediscovering the
+                    // staleness independently on its own next batch.
+                    invalidation.invalidateTable(fullyQualifiedTableName);
+                    return fresh;
+                }
+                // The re-read did NOT produce the column, so the cache was
+                // never stale: getColumnsDataTypesForTable excludes ALIAS and
+                // MATERIALIZED columns, because binding either makes
+                // ClickHouse reject the INSERT.
+                //
+                // The two kinds are NOT equivalent. This connector replicates
+                // a source database into ClickHouse, which makes the SOURCE
+                // the authority on what the data is -- and makes this
+                // connector the thing that ENFORCES that on the replica. An
+                // ALIAS column stores nothing, so there is nothing to
+                // disagree about. A MATERIALIZED column DOES store a value,
+                // computed locally, so when the source also supplies that
+                // column the replica silently holds ClickHouse's derived
+                // value instead of the source's. That is a real divergence,
+                // and the ClickHouse definition is what is wrong -- so it is
+                // corrected here rather than merely reported.
+                if (enforceSourceColumnIsWritable(unknown, tableName,
+                        databaseName, fullyQualifiedTableName, connection,
+                        config)) {
+                    // The column is writable now. Re-read so this batch binds
+                    // the source value, and bump the version so every other
+                    // cached writer picks up the corrected schema. Do NOT
+                    // record a proven-absent entry: the column is no longer
+                    // absent, and caching that would suppress the very write
+                    // the enforcement just enabled.
+                    Map<String, String> enforced = new DBMetadata(config)
+                            .getColumnsDataTypesForTable(tableName, connection,
+                                    databaseName);
+                    if (enforced != null && containsColumn(enforced, unknown)) {
+                        invalidation.invalidateTable(fullyQualifiedTableName);
+                        return enforced;
+                    }
+                }
+                // Either nothing needed enforcing (ALIAS), or enforcement did
+                // not succeed. Record the proof so the metadata read is not
+                // repeated for EVERY record -- without it the invalidateTable()
+                // above would make every cached writer rebuild on its next
+                // batch, producing an unbounded system.columns query storm for
+                // as long as the table keeps receiving traffic.
+                invalidation.markColumnProvenAbsent(fullyQualifiedTableName, unknown);
                 return fresh;
             }
             log.warn("Re-read of {}.{} returned no columns; keeping the cached map. The "
@@ -355,6 +411,140 @@ public class GroupInsertQueryWithBatchRecords {
                     databaseName, tableName, e);
         }
         return null;
+    }
+
+    /**
+     * Makes ClickHouse able to store a source column that its current
+     * definition refuses, and reports when it cannot.
+     *
+     * <p>The connector replicates a source database into ClickHouse: the
+     * source is the authority on what the data is, and this connector is what
+     * ENFORCES that on the replica. So when the ClickHouse side is in a shape
+     * that prevents the source value from being stored, the answer is to
+     * change the ClickHouse side -- not to note the problem and move on.</p>
+     *
+     * <p>What is done depends on why the column is unwritable:</p>
+     *
+     * <ul>
+     *   <li><b>ALIAS</b> -- not stored at all. The column is computed at
+     *       query time from other columns, so there is no stored value that
+     *       can disagree with the source and nothing to enforce. Logged at
+     *       debug; returns false.</li>
+     *   <li><b>MATERIALIZED</b> -- stored, and computed by ClickHouse. The
+     *       source sends a value and the replica keeps a DIFFERENT one,
+     *       silently: no error, no failed batch, identical row counts, so
+     *       only a value-level checksum would ever reveal it. The
+     *       MATERIALIZED definition is what is wrong, so it is removed with
+     *       {@code ALTER TABLE ... MODIFY COLUMN}, leaving an ordinary column
+     *       the source value lands in. Returns true on success.</li>
+     *   <li><b>unknown</b> -- the kind could not be read, so there is nothing
+     *       safe to alter. Logged at warn rather than assumed benign;
+     *       returns false.</li>
+     * </ul>
+     *
+     * <p><b>Enforcement fixes the write path forward, not history.</b> Rows
+     * written while the column was MATERIALIZED still hold ClickHouse's
+     * computed values. Those are reconciled by a backfill of the affected
+     * range, and the log says so explicitly so the remaining work is visible
+     * rather than assumed done.</p>
+     *
+     * <p>The DDL is metadata-only: {@code MODIFY COLUMN} restating the same
+     * type does not rewrite existing parts, so it neither blocks nor costs
+     * I/O. It runs on the same path and privilege the connector already uses
+     * for schema evolution ({@code ClickHouseAlterTable}).</p>
+     *
+     * @param columnName              the source column that cannot be written.
+     * @param tableName               the ClickHouse table name.
+     * @param databaseName            the ClickHouse database name.
+     * @param fullyQualifiedTableName "database.table", for log messages.
+     * @param connection              connection used to read metadata and
+     *                                issue the DDL.
+     * @param config                  the connector configuration.
+     * @return true when the column is now writable and the caller should
+     *         re-read the schema; false when there was nothing to enforce or
+     *         enforcement did not succeed.
+     */
+    private boolean enforceSourceColumnIsWritable(
+            String columnName, String tableName, String databaseName,
+            String fullyQualifiedTableName, Connection connection,
+            ClickHouseSinkConnectorConfig config) {
+
+        DBMetadata metadata = new DBMetadata(config);
+        String kind = metadata.getColumnDefaultKind(
+                tableName, databaseName, columnName, connection);
+
+        if ("ALIAS".equalsIgnoreCase(kind)) {
+            log.debug("Column '{}' is an ALIAS on {} and is not stored, so no stored "
+                            + "value can disagree with the source and there is nothing "
+                            + "to enforce. The record's value for it is ignored.",
+                    columnName, fullyQualifiedTableName);
+            return false;
+        }
+
+        if ("MATERIALIZED".equalsIgnoreCase(kind)) {
+            String columnType = metadata.getColumnType(
+                    tableName, databaseName, columnName, connection);
+            if (columnType == null || columnType.isEmpty()) {
+                log.warn("SOURCE VALUE SHADOWED: {} defines column '{}' as MATERIALIZED, "
+                                + "so ClickHouse stores its own computed value and the "
+                                + "source's value is never written -- but the column's "
+                                + "declared type could not be read, so the definition "
+                                + "cannot be corrected automatically. Redefine '{}' as an "
+                                + "ordinary column so the replicated value is stored.",
+                        fullyQualifiedTableName, columnName, columnName);
+                return false;
+            }
+
+            log.warn("SOURCE VALUE SHADOWED: {} defines column '{}' as MATERIALIZED, so "
+                            + "ClickHouse has been storing its own computed value instead "
+                            + "of the source's. The source is the authority for replicated "
+                            + "data, so the ClickHouse definition is being corrected: "
+                            + "dropping the MATERIALIZED expression from '{}' ({}) so the "
+                            + "replicated value is stored from now on.",
+                    fullyQualifiedTableName, columnName, columnName, columnType);
+
+            if (metadata.makeColumnWritable(tableName, databaseName, columnName,
+                    columnType, connection)) {
+                log.warn("ENFORCED: '{}' on {} now stores the source value. Rows written "
+                                + "BEFORE this point still hold ClickHouse's computed "
+                                + "values -- backfill the affected range to bring the "
+                                + "existing data into agreement with the source.",
+                        columnName, fullyQualifiedTableName);
+                return true;
+            }
+            return false;
+        }
+
+        log.warn("Column '{}' carried by the record is not in {}'s writable column map "
+                        + "after a fresh metadata read, and its default_kind could not be "
+                        + "determined ({}). The value will not be written; verify against "
+                        + "the source whether this column should be replicated.",
+                columnName, fullyQualifiedTableName, kind == null ? "unknown" : kind);
+        return false;
+    }
+
+    /**
+     * Case-insensitive membership test against a column map's key set.
+     *
+     * <p>The cached map is compared case-insensitively everywhere else in this
+     * class, so the post-re-read check must be too -- otherwise a column whose
+     * ClickHouse casing differs from the source's would be judged still-missing
+     * and marked proven-absent even though the re-read did resolve it.</p>
+     *
+     * @param columns    the column map to search.
+     * @param columnName the column name to look for.
+     * @return true when the map contains the column under any casing.
+     */
+    private boolean containsColumn(Map<String, String> columns, String columnName) {
+        if (columns == null || columnName == null) {
+            return false;
+        }
+        for (String column : columns.keySet()) {
+            if (column != null && column.equalsIgnoreCase(columnName)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
