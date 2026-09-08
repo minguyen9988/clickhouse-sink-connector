@@ -361,22 +361,29 @@ public class GroupInsertQueryWithBatchRecords {
                     return fresh;
                 }
                 // The re-read did NOT produce the column, so the cache was
-                // never stale. The column is one ClickHouse computes --
-                // getColumnsDataTypesForTable filters MATERIALIZED and ALIAS
-                // out by design, because binding them makes ClickHouse reject
-                // the INSERT. Record the proof and use the fresh map.
+                // never stale: getColumnsDataTypesForTable excludes ALIAS and
+                // MATERIALIZED columns, because binding either makes
+                // ClickHouse reject the INSERT.
                 //
-                // Without the proof this path repeats for EVERY record, and
-                // the invalidateTable() on top of it makes every cached writer
-                // for the table rebuild on its next batch. The result is an
-                // unbounded system.columns query storm for as long as the
-                // table keeps receiving traffic -- see the PR description for
-                // a measured production case.
-                log.info("Column '{}' is not part of {}'s writable column map after a "
-                                + "fresh read; it is computed by ClickHouse (MATERIALIZED "
-                                + "or ALIAS) and is correctly excluded. Recording this so "
-                                + "the metadata read is not repeated per record.",
-                        unknown, fullyQualifiedTableName);
+                // Record the proof either way -- without it this path repeats
+                // for EVERY record, and the invalidateTable() above would make
+                // every cached writer for the table rebuild on its next batch,
+                // producing an unbounded system.columns query storm for as
+                // long as the table keeps receiving traffic.
+                //
+                // But the two kinds are NOT equivalent, so report them
+                // differently. This connector replicates a source database
+                // into ClickHouse, which makes the SOURCE the authority on
+                // what the data is; ClickHouse is the replica and has to agree
+                // with it. An ALIAS column stores nothing, so there is nothing
+                // to disagree about. A MATERIALIZED column DOES store a value,
+                // computed locally -- so when the source also supplies that
+                // column, the replica silently holds ClickHouse's derived
+                // value instead of the source's, with no error and identical
+                // row counts. That is a real divergence and it must be
+                // visible, not filed away as correct.
+                reportUnwritableColumn(unknown, tableName, databaseName,
+                        fullyQualifiedTableName, connection, config);
                 invalidation.markColumnProvenAbsent(fullyQualifiedTableName, unknown);
                 return fresh;
             }
@@ -389,6 +396,81 @@ public class GroupInsertQueryWithBatchRecords {
                     databaseName, tableName, e);
         }
         return null;
+    }
+
+    /**
+     * Reports a source column that ClickHouse will not let the connector
+     * write, at a severity that matches what it actually costs.
+     *
+     * <p>The connector replicates a source database into ClickHouse, so the
+     * source is the authority on what the data is and the replica is expected
+     * to agree with it. Whether a column being unwritable matters therefore
+     * depends entirely on whether ClickHouse STORES something in its place:</p>
+     *
+     * <ul>
+     *   <li><b>ALIAS</b> -- not stored. The column is computed at query time
+     *       from other columns, so there is no stored value that can disagree
+     *       with the source. Nothing is lost; logged at debug.</li>
+     *   <li><b>MATERIALIZED</b> -- stored, and computed by ClickHouse. The
+     *       source sends a value for this column and the replica keeps a
+     *       DIFFERENT one, silently: no error, no failed batch, and identical
+     *       row counts, so only a value-level checksum would ever reveal it.
+     *       Logged at warn, naming the remediation, because the fix is to
+     *       stop the ClickHouse definition from shadowing the source
+     *       (redefine the column as an ordinary one, or stop replicating it),
+     *       not to accept the divergence.</li>
+     *   <li><b>unknown</b> -- the kind could not be read. Logged at warn so
+     *       the situation is not silently assumed benign.</li>
+     * </ul>
+     *
+     * <p>Purely diagnostic: it never changes what is written. Binding a
+     * MATERIALIZED column would make ClickHouse reject the whole batch, which
+     * would turn a silent divergence into a stalled pipeline. Surfacing it is
+     * what lets an operator fix the schema.</p>
+     *
+     * @param columnName              the source column that cannot be written.
+     * @param tableName               the ClickHouse table name.
+     * @param databaseName            the ClickHouse database name.
+     * @param fullyQualifiedTableName "database.table", for log messages.
+     * @param connection              connection used to read the column kind.
+     * @param config                  the connector configuration.
+     */
+    private void reportUnwritableColumn(String columnName, String tableName,
+                                        String databaseName,
+                                        String fullyQualifiedTableName,
+                                        Connection connection,
+                                        ClickHouseSinkConnectorConfig config) {
+        String kind = new DBMetadata(config)
+                .getColumnDefaultKind(tableName, databaseName, columnName, connection);
+
+        if ("ALIAS".equalsIgnoreCase(kind)) {
+            log.debug("Column '{}' is an ALIAS on {} and is not stored, so the record's "
+                            + "value for it is ignored. Not repeating this metadata read "
+                            + "per record.",
+                    columnName, fullyQualifiedTableName);
+            return;
+        }
+
+        if ("MATERIALIZED".equalsIgnoreCase(kind)) {
+            log.warn("SOURCE VALUE SHADOWED: the incoming record carries column '{}', but "
+                            + "{} defines it as MATERIALIZED, so ClickHouse stores its own "
+                            + "computed value and the source's value is never written. The "
+                            + "source database is the authority for replicated data, so the "
+                            + "two sides now disagree on this column -- silently, with "
+                            + "matching row counts, detectable only by a value-level "
+                            + "checksum. Remediation is on the ClickHouse side: redefine "
+                            + "'{}' as an ordinary column so the replicated value is stored, "
+                            + "or exclude the column from replication if the computed value "
+                            + "is genuinely wanted instead.",
+                    columnName, fullyQualifiedTableName, columnName);
+            return;
+        }
+
+        log.warn("Column '{}' carried by the record is not in {}'s writable column map "
+                        + "after a fresh metadata read, and its default_kind could not be "
+                        + "determined ({}). The value will not be written; verify against "
+                        + "the source whether this column should be replicated.",
+                columnName, fullyQualifiedTableName, kind == null ? "unknown" : kind);
     }
 
     /**

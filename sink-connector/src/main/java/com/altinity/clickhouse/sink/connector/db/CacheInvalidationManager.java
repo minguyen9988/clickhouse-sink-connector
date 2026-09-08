@@ -48,7 +48,7 @@ public class CacheInvalidationManager {
      * cached column map. {@code DBMetadata#getColumnsDataTypesForTable}
      * deliberately drops columns whose {@code default_kind} is
      * {@code MATERIALIZED} or {@code ALIAS}, because ClickHouse computes those
-     * and refuses an INSERT that binds them. A source column that is
+     * and refuses an INSERT that binds them. A source column that was made
      * MATERIALIZED on the ClickHouse side is therefore absent from the map
      * permanently and correctly -- it is not evidence of a stale cache, and
      * re-reading metadata will never make it appear.</p>
