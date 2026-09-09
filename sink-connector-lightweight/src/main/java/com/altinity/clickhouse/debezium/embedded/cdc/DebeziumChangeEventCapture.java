@@ -301,6 +301,10 @@ public class DebeziumChangeEventCapture {
             useValidatingDriver(props, "schema.history.internal.jdbc.url");
         }
 
+        // Guarantee that end-of-snapshot state can actually reach the offset
+        // store. See ensureHeartbeatInterval for why this is not optional.
+        ensureHeartbeatInterval(props);
+
         try {
             DebeziumEngine.Builder<ChangeEvent<SourceRecord, SourceRecord>> changeEventBuilder =
                     DebeziumEngine.create(Connect.class);
@@ -524,6 +528,77 @@ public class DebeziumChangeEventCapture {
      * Keep in sync with SinkConnectorDataSource.V1_DRIVER_MARKER.
      */
     static final String V1_DRIVER_MARKER = "clickhouse.jdbc.v1";
+
+    /** Debezium's heartbeat interval property. Defaults to 0 (disabled). */
+    static final String HEARTBEAT_INTERVAL_MS = "heartbeat.interval.ms";
+
+    /**
+     * Default heartbeat interval applied when the user has not set one.
+     *
+     * <p>Short enough that a snapshot of a small, idle database reaches its
+     * committed end-of-snapshot state within seconds rather than never; long
+     * enough to be irrelevant to a busy source, where rows are flowing and
+     * the heartbeat path is not what advances the offset.</p>
+     */
+    static final String DEFAULT_HEARTBEAT_INTERVAL_MS = "5000";
+
+    /**
+     * Ensures Debezium emits heartbeats, because the connector's
+     * end-of-snapshot state depends on them.
+     *
+     * <p><b>Why this is not optional (issue #1379, "Initial Snapshot never
+     * finishes").</b> Debezium marks a snapshot complete only AFTER the last
+     * snapshot row is emitted, so every snapshot ROW still carries
+     * {@code snapshot=INITIAL, snapshot_completed=false}. The completed state
+     * rides exclusively on records emitted after the snapshot. On a source
+     * that is idle once the snapshot ends -- which is the normal case for the
+     * small test databases people first try the connector on -- there are no
+     * such records except heartbeats.</p>
+     *
+     * <p>Committing the offset from those control records is what
+     * {@code commitControlRecordOffset} exists to do. But that machinery can
+     * only act on a heartbeat that is actually emitted, and Debezium's
+     * {@code heartbeat.interval.ms} defaults to 0, which disables heartbeats
+     * entirely. The connector never set it. So on an idle source the fix had
+     * nothing to fire on and the offset stayed at
+     * {@code snapshot_completed=false} forever.</p>
+     *
+     * <p><b>Why that is destructive rather than cosmetic.</b> On restart
+     * Debezium reads the persisted offset, sees a snapshot that never
+     * completed, and re-runs the whole snapshot from the beginning
+     * ({@code InitialSnapshotter#shouldSnapshotData} keys off exactly this
+     * state). Every restart re-snapshots, so the connector can never make
+     * forward progress past its first snapshot and the target is rewritten
+     * from scratch each time.</p>
+     *
+     * <p>A user-supplied value always wins: this only fills in a default when
+     * the property is absent or blank. Setting it to {@code 0} explicitly is
+     * honoured, which keeps the escape hatch for anyone who has a reason to
+     * disable heartbeats and accepts the consequence.</p>
+     *
+     * @param props the Debezium properties, mutated in place.
+     */
+    static void ensureHeartbeatInterval(Properties props) {
+        if (props == null) {
+            return;
+        }
+        String configured = props.getProperty(HEARTBEAT_INTERVAL_MS);
+        if (configured != null && !configured.trim().isEmpty()) {
+            log.info("Heartbeat interval is set to {}ms by configuration; leaving it "
+                            + "unchanged. Note that a value of 0 disables heartbeats, and "
+                            + "on a source that goes idle after the initial snapshot the "
+                            + "snapshot's completed state will then never be committed "
+                            + "(issue #1379).",
+                    configured);
+            return;
+        }
+        props.setProperty(HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_INTERVAL_MS);
+        log.info("No {} configured; defaulting to {}ms. Heartbeats are what carry the "
+                        + "end-of-snapshot state to the offset store on an idle source, so "
+                        + "leaving them disabled would make the initial snapshot re-run on "
+                        + "every restart (issue #1379).",
+                HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_INTERVAL_MS);
+    }
 
     /**
      * Ensures the ClickHouse JDBC URL in the given property key has the
