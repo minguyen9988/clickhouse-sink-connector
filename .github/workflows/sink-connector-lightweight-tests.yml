@@ -42,7 +42,21 @@ jobs:
         run: mvn clean install -DskipTests=true
       - name: Build Replicator with Maven
         working-directory: sink-connector-lightweight
-        run: mvn --quiet surefire-report:report
+        # `surefire-report:report` is a REPORTING goal: invoked bare, it does
+        # not bind to the lifecycle and therefore never runs the `test` phase.
+        # It only formats surefire XML that already exists -- and on a clean
+        # runner none does, so it emitted an empty report and the job passed
+        # in ~55s having executed zero tests. The junit-report step said so
+        # every run ("No annotations found for JUnit Test Report") while the
+        # check stayed green.
+        #
+        # `mvn test` runs them; `surefire-report:report` then formats the XML
+        # it produced. -Dmaven.test.failure.ignore lets the report step be the
+        # thing that fails the job, so a failure is annotated on the PR rather
+        # than aborting before the report is written.
+        run: |
+          mvn --quiet test -Dmaven.test.failure.ignore=true
+          mvn --quiet surefire-report:report-only
       - name: Publish Test Report
         uses: mikepenz/action-junit-report@v4
         if: always()
